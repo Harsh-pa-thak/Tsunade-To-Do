@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "generator": "tools/build_assets.py",
+  "source": "assets/source/tsunade.png",
+  "render_height": 720,
+  "cell": {
+    "w": 553,
+    "h": 856
+  },
+  "ground": {
+    "x": 276.5,
+    "y": 835
+  },
+  "static": "tsunade_sprite.png",
+  "icon": "tsunade_icon.png",
+  "reactions": [
+    "jiggle",
+    "spin",
+    "hop",
+    "shake"
+  ],
+  "animations": {
+    "idle": {
+      "label": "Idle breathing",
+      "sheet": "sheet_idle.png",
+      "gif": "anim_idle.gif",
+      "frames": 24,
+      "frame_ms": 90,
+      "loop": true,
+      "reactions": false
+    },
+    "jiggle": {
+      "label": "Poke wobble",
+      "sheet": "sheet_jiggle.png",
+      "gif": "anim_jiggle.gif",
+      "frames": 18,
+      "frame_ms": 50,
+      "loop": false,
+      "reactions": true
+    },
+    "spin": {
+      "label": "Turn around",
+      "sheet": "sheet_spin.png",
+      "gif": "anim_spin.gif",
+      "frames": 30,
+      "frame_ms": 50,
+      "loop": false,
+      "reactions": true
+    },
+    "hop": {
+      "label": "Happy hop",
+      "sheet": "sheet_hop.png",
+      "gif": "anim_hop.gif",
+      "frames": 20,
+      "frame_ms": 55,
+      "loop": false,
+      "reactions": true
+    },
+    "shake": {
+      "label": "Head shake",
+      "sheet": "sheet_shake.png",
+      "gif": "anim_shake.gif",
+      "frames": 16,
+      "frame_ms": 50,
+      "loop": false,
+      "reactions": true
+    }
+  },
+  "mask": "tsunade_mask.png"
+}
