@@ -2,6 +2,10 @@
 
 :class:`TodoStore` is plain Python (no Qt) so it can be unit-tested headlessly;
 :class:`TodoWindow` is the presentation layer on top of it.
+
+Tasks live in named lists. The window shows one tab per list plus an *All* tab
+that gathers every task, a button for creating lists, and a move control on
+each task so it can be sent to another list.
 """
 
 from __future__ import annotations
@@ -17,14 +21,20 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QTabBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -32,9 +42,23 @@ from PySide6.QtWidgets import (
 
 from .config import todo_file, write_json
 
+#: Name of the list an existing single-list file is migrated into, and of the
+#: first list a brand-new file gets.
+DEFAULT_LIST_NAME = "General"
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _clean(text: object) -> str:
+    return " ".join(str(text or "").split())
+
+
+@dataclass
+class TodoList:
+    id: str
+    name: str
 
 
 @dataclass
@@ -43,6 +67,7 @@ class TodoItem:
     text: str
     done: bool = False
     created: str = ""
+    list_id: str = ""
 
 
 class TodoStore:
@@ -51,6 +76,7 @@ class TodoStore:
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else todo_file()
         self.items: list[TodoItem] = []
+        self.lists: list[TodoList] = []
         #: Set when a damaged file had to be set aside on load.
         self.recovered_from: str | None = None
         self.load()
@@ -59,8 +85,10 @@ class TodoStore:
 
     def load(self) -> list[TodoItem]:
         self.items = []
+        self.lists = []
         self.recovered_from = None
         if not self.path.exists():
+            self._normalise()
             return self.items
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -71,14 +99,29 @@ class TodoStore:
                 self.recovered_from = str(backup)
             except OSError:
                 pass
+            self._normalise()
             return self.items
+
+        list_entries = raw.get("lists") if isinstance(raw, dict) else None
+        seen_lists: set[str] = set()
+        for entry in list_entries or []:
+            if not isinstance(entry, dict):
+                continue
+            name = _clean(entry.get("name"))
+            if not name:
+                continue
+            list_id = str(entry.get("id") or uuid.uuid4().hex)
+            if list_id in seen_lists:
+                list_id = uuid.uuid4().hex
+            seen_lists.add(list_id)
+            self.lists.append(TodoList(id=list_id, name=name))
 
         entries = raw.get("items") if isinstance(raw, dict) else None
         seen: set[str] = set()
         for entry in entries or []:
             if not isinstance(entry, dict):
                 continue
-            text = str(entry.get("text", "")).strip()
+            text = _clean(entry.get("text"))
             if not text:
                 continue
             item_id = str(entry.get("id") or uuid.uuid4().hex)
@@ -91,27 +134,61 @@ class TodoStore:
                     text=text,
                     done=bool(entry.get("done", False)),
                     created=str(entry.get("created") or _now()),
+                    list_id=str(entry.get("list_id") or ""),
                 )
             )
+        # Older files have no ``lists`` key and no ``list_id`` on their tasks;
+        # they end up in one default list, keeping their order intact.
+        self._normalise()
         return self.items
 
     def save(self) -> None:
         write_json(
             self.path,
             {
-                "version": 1,
+                "version": 2,
                 "updated": _now(),
+                "lists": [{"id": lst.id, "name": lst.name} for lst in self.lists],
                 "items": [
-                    {"id": i.id, "text": i.text, "done": i.done, "created": i.created}
+                    {
+                        "id": i.id,
+                        "text": i.text,
+                        "done": i.done,
+                        "created": i.created,
+                        "list_id": i.list_id,
+                    }
                     for i in self.items
                 ],
             },
         )
 
+    def _normalise(self) -> None:
+        """Guarantee at least one list and that every task belongs to one."""
+        if not self.lists:
+            self.lists.append(TodoList(id=uuid.uuid4().hex, name=DEFAULT_LIST_NAME))
+        valid = {lst.id for lst in self.lists}
+        for item in self.items:
+            if item.list_id not in valid:
+                item.list_id = self.lists[0].id
+
     # -- queries ----------------------------------------------------------
 
     def get(self, item_id: str) -> TodoItem | None:
         return next((i for i in self.items if i.id == item_id), None)
+
+    def list_by_id(self, list_id: str | None) -> TodoList | None:
+        return next((lst for lst in self.lists if lst.id == list_id), None)
+
+    def items_for(self, list_id: str | None = None) -> list[TodoItem]:
+        """Tasks in one list, or every task when *list_id* is ``None``."""
+        if list_id is None:
+            return list(self.items)
+        return [i for i in self.items if i.list_id == list_id]
+
+    def counts(self, list_id: str | None = None) -> tuple[int, int]:
+        """``(total, done)`` for one list, or for everything."""
+        items = self.items_for(list_id)
+        return len(items), sum(1 for i in items if i.done)
 
     @property
     def done_count(self) -> int:
@@ -123,14 +200,40 @@ class TodoStore:
 
     # -- mutations --------------------------------------------------------
 
-    def add(self, text: str) -> TodoItem | None:
-        text = " ".join(text.split())
+    def add_list(self, name: str) -> TodoList | None:
+        """Create a list; ``None`` when the name is blank or already taken."""
+        name = _clean(name)
+        if not name:
+            return None
+        if any(lst.name.casefold() == name.casefold() for lst in self.lists):
+            return None
+        created = TodoList(id=uuid.uuid4().hex, name=name)
+        self.lists.append(created)
+        self.save()
+        return created
+
+    def add(self, text: str, list_id: str | None = None) -> TodoItem | None:
+        text = _clean(text)
         if not text:
             return None
-        item = TodoItem(id=uuid.uuid4().hex, text=text, done=False, created=_now())
+        if not self.lists:
+            self._normalise()
+        target = self.list_by_id(list_id) or self.lists[0]
+        item = TodoItem(
+            id=uuid.uuid4().hex, text=text, done=False, created=_now(), list_id=target.id
+        )
         self.items.append(item)
         self.save()
         return item
+
+    def move(self, item_id: str, list_id: str) -> bool:
+        """Send a task to another list."""
+        item = self.get(item_id)
+        if item is None or self.list_by_id(list_id) is None or item.list_id == list_id:
+            return False
+        item.list_id = list_id
+        self.save()
+        return True
 
     def set_done(self, item_id: str, done: bool) -> bool:
         item = self.get(item_id)
@@ -154,9 +257,14 @@ class TodoStore:
         self.save()
         return True
 
-    def clear_completed(self) -> int:
+    def clear_completed(self, list_id: str | None = None) -> int:
+        """Drop finished tasks - from one list, or from all of them."""
         before = len(self.items)
-        self.items = [i for i in self.items if not i.done]
+        self.items = [
+            i
+            for i in self.items
+            if not (i.done and (list_id is None or i.list_id == list_id))
+        ]
         removed = before - len(self.items)
         if removed:
             self.save()
@@ -177,6 +285,10 @@ QLabel#title { font-size: 16px; font-weight: 600; color: #ffd977; }
 QLabel#subtitle { color: #c8aebd; }
 QLabel#hint { color: #a98f9f; font-style: italic; }
 QLabel#count { color: #e7d5b0; }
+QLabel#tag {
+    color: #c8aebd; background: #3a2430; border-radius: 6px;
+    padding: 0 6px; font-size: 11px;
+}
 QLineEdit {
     background: #3a2430;
     border: 1px solid #5b3a4a;
@@ -186,6 +298,20 @@ QLineEdit {
     selection-background-color: #b8860b;
 }
 QLineEdit:focus { border: 1px solid #f0b429; }
+QComboBox {
+    background: #3a2430;
+    border: 1px solid #5b3a4a;
+    border-radius: 8px;
+    padding: 6px 8px;
+    color: #fdf6ea;
+}
+QComboBox:focus { border: 1px solid #f0b429; }
+QComboBox QAbstractItemView {
+    background: #2b1a24;
+    color: #f7efe2;
+    border: 1px solid #5b3a4a;
+    selection-background-color: #5a2b38;
+}
 QPushButton {
     background: #f0b429;
     color: #2b1a24;
@@ -204,6 +330,16 @@ QPushButton#ghost {
     font-weight: 500;
 }
 QPushButton#ghost:hover { border-color: #f0b429; color: #ffd977; }
+QPushButton#tab {
+    background: transparent;
+    color: #c8aebd;
+    border: none;
+    border-radius: 7px;
+    padding: 4px 11px;
+    font-weight: 500;
+}
+QPushButton#tab:hover { background: #3a2430; color: #ffd977; }
+QPushButton#tab:checked { background: #f0b429; color: #2b1a24; font-weight: 600; }
 QListWidget {
     background: transparent;
     border: none;
@@ -225,6 +361,13 @@ QToolButton {
     font-size: 14px; padding: 2px 6px; background: transparent;
 }
 QToolButton:hover { background: #5a2b38; color: #ffb3b3; }
+QMenu {
+    background: #2b1a24; color: #f7efe2;
+    border: 1px solid #5b3a4a; border-radius: 8px; padding: 4px;
+}
+QMenu::item { padding: 5px 16px; border-radius: 6px; }
+QMenu::item:selected { background: #5a2b38; color: #ffd977; }
+QMenu::separator { height: 1px; background: #462b39; margin: 4px 8px; }
 QProgressBar {
     background: #3a2430; border: none; border-radius: 4px;
     height: 6px; text-align: center;
@@ -235,12 +378,19 @@ QFrame#rule { background: #462b39; max-height: 1px; border: none; }
 
 
 class TodoRow(QWidget):
-    """One task: checkbox, text and a delete button."""
+    """One task: checkbox, text, optional list tag, move and delete buttons."""
 
     toggled = Signal(str, bool)
     deleted = Signal(str)
+    moved = Signal(str, str)
 
-    def __init__(self, item: TodoItem, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        item: TodoItem,
+        lists: list[TodoList] | tuple = (),
+        show_list: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.item_id = item.id
         layout = QHBoxLayout(self)
@@ -261,6 +411,39 @@ class TodoRow(QWidget):
         self.label.setFont(font)
         self.label.setStyleSheet("color: #a08e99;" if item.done else "")
 
+        self.list_name = next((lst.name for lst in lists if lst.id == item.list_id), "")
+        self.tag: QLabel | None = None
+        # Only worth showing when there is more than one list to tell apart,
+        # and kept to one compact line so it never stretches the row.
+        if show_list and self.list_name and len(lists) > 1:
+            self.tag = QLabel(self.list_name, self)
+            self.tag.setObjectName("tag")
+            self.tag.setAlignment(Qt.AlignCenter)
+            self.tag.setFixedHeight(18)
+            self.tag.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+            self.tag.setToolTip(f"In the list {self.list_name}")
+
+        self.move: QToolButton | None = None
+        others = [lst for lst in lists if lst.id != item.list_id]
+        if others:
+            self.move = QToolButton(self)
+            self.move.setText("\u21c4")
+            self.move.setToolTip("Move this task to another list")
+            self.move.setCursor(Qt.PointingHandCursor)
+            menu = QMenu(self.move)
+            for lst in others:
+                action = menu.addAction(lst.name)
+                action.triggered.connect(
+                    lambda _checked=False, lid=lst.id: self.moved.emit(self.item_id, lid)
+                )
+            menu.addSeparator()
+            current = next((lst for lst in lists if lst.id == item.list_id), None)
+            if current is not None:
+                now = menu.addAction(f"now in {current.name}")
+                now.setEnabled(False)
+            self.move.setMenu(menu)
+            self.move.setPopupMode(QToolButton.InstantPopup)
+
         self.delete = QToolButton(self)
         self.delete.setText("\u2715")
         self.delete.setToolTip("Delete task")
@@ -268,6 +451,10 @@ class TodoRow(QWidget):
 
         layout.addWidget(self.check)
         layout.addWidget(self.label, 1)
+        if self.tag is not None:
+            layout.addWidget(self.tag, 0, Qt.AlignVCenter)
+        if self.move is not None:
+            layout.addWidget(self.move)
         layout.addWidget(self.delete)
 
         # Connect only after the initial state is in place, so building a row
@@ -301,7 +488,7 @@ class TodoWindow(QWidget):
         self.setWindowTitle("Tsunade's To-Do list")
         if icon is not None:
             self.setWindowIcon(icon)
-        self.setMinimumSize(360, 420)
+        self.setMinimumSize(380, 460)
         self.setStyleSheet(STYLE)
 
         self._geometry_timer = QTimer(self)
@@ -328,7 +515,7 @@ class TodoWindow(QWidget):
         titles.setSpacing(1)
         title = QLabel("Tsunade's To-Do list", card)
         title.setObjectName("title")
-        subtitle = QLabel("Click a box to check a task off.", card)
+        subtitle = QLabel("Check a box; \u21c4 moves a task to another list.", card)
         subtitle.setObjectName("subtitle")
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -340,14 +527,51 @@ class TodoWindow(QWidget):
         rule.setFrameShape(QFrame.HLine)
         root.addWidget(rule)
 
+        # -- lists ---------------------------------------------------------
+        listbar = QHBoxLayout()
+        listbar.setSpacing(6)
+        self.tabs = QTabBar(card)
+        self.tabs.setExpanding(False)
+        self.tabs.setDrawBase(False)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setElideMode(Qt.ElideRight)
+        self.tabs.setFocusPolicy(Qt.NoFocus)
+        self.tabs.setStyleSheet(
+            """
+            QTabBar { background: transparent; }
+            QTabBar::tab {
+                background: #3a2430; color: #c8aebd;
+                border: none; border-radius: 7px;
+                padding: 5px 11px; margin-right: 4px;
+                font-weight: 500;
+            }
+            QTabBar::tab:selected { background: #f0b429; color: #2b1a24; font-weight: 600; }
+            QTabBar::tab:hover:!selected { background: #4d3040; color: #ffd977; }
+            QTabBar QToolButton { background: #3a2430; border-radius: 4px; padding: 0 3px; }
+            QTabBar QToolButton:hover { background: #5a2b38; }
+            """
+        )
+        self.new_list_button = QPushButton("+ List", card)
+        self.new_list_button.setObjectName("ghost")
+        self.new_list_button.setToolTip("Add another list")
+        self.new_list_button.setCursor(Qt.PointingHandCursor)
+        listbar.addWidget(self.tabs, 1)
+        listbar.addWidget(self.new_list_button)
+        root.addLayout(listbar)
+
+        # -- entry ---------------------------------------------------------
         entry = QHBoxLayout()
         entry.setSpacing(8)
         self.input = QLineEdit(card)
         self.input.setPlaceholderText("What needs doing today?")
         self.input.setClearButtonEnabled(True)
+        self.target_list = QComboBox(card)
+        self.target_list.setToolTip("New tasks go into this list")
+        self.target_list.setMinimumContentsLength(6)
         self.add_button = QPushButton("Add", card)
         self.add_button.setCursor(Qt.PointingHandCursor)
         entry.addWidget(self.input, 1)
+        entry.addWidget(self.target_list)
         entry.addWidget(self.add_button)
         root.addLayout(entry)
 
@@ -388,10 +612,74 @@ class TodoWindow(QWidget):
         self.clear_button.clicked.connect(self._clear_completed)
         self.close_button.clicked.connect(self.hide)
         self.list.delete_requested.connect(self._delete)
+        self.new_list_button.clicked.connect(self._new_list)
+        self.tabs.currentChanged.connect(lambda _index: self.refresh())
 
         self.refresh()
 
     # -- helpers ----------------------------------------------------------
+
+    def current_list_id(self) -> str | None:
+        """The list the visible tab stands for; ``None`` is the *All* tab."""
+        index = self.tabs.currentIndex()
+        if index < 0:
+            return None
+        return self.tabs.tabData(index) or None
+
+    def _tabs_match_store(self) -> bool:
+        """Whether the tab bar already shows exactly the store's lists."""
+        if self.tabs.count() != len(self.store.lists) + 1:
+            return False
+        if self.tabs.tabData(0) != "" or self.tabs.tabText(0) != "All":
+            return False
+        return all(
+            self.tabs.tabData(index + 1) == lst.id
+            and self.tabs.tabText(index + 1) == lst.name
+            for index, lst in enumerate(self.store.lists)
+        )
+
+    def _update_tab_tooltips(self) -> None:
+        self.tabs.setTabToolTip(0, "Every task, whatever its list")
+        for index in range(1, self.tabs.count()):
+            total, done = self.store.counts(self.tabs.tabData(index))
+            self.tabs.setTabToolTip(
+                index,
+                f"{total} task{'s' if total != 1 else ''}, {done} done"
+                if total
+                else "Empty list",
+            )
+
+    def _rebuild_tabs(self) -> None:
+        wanted = self.current_list_id()
+        self.tabs.blockSignals(True)
+        while self.tabs.count():
+            self.tabs.removeTab(0)
+        self.tabs.addTab("All")
+        self.tabs.setTabData(0, "")
+        selected = 0
+        for lst in self.store.lists:
+            index = self.tabs.addTab(lst.name)
+            self.tabs.setTabData(index, lst.id)
+            if lst.id == wanted:
+                selected = index
+        self.tabs.setCurrentIndex(selected)
+        self.tabs.blockSignals(False)
+        self._update_tab_tooltips()
+        self._sync_target_list()
+
+    def _sync_target_list(self) -> None:
+        """Keep the "add into" picker in step with the lists and the tab."""
+        current = self.current_list_id()
+        previous = self.target_list.currentData()
+        self.target_list.blockSignals(True)
+        self.target_list.clear()
+        for lst in self.store.lists:
+            self.target_list.addItem(lst.name, lst.id)
+        target = current if current is not None else previous
+        index = self.target_list.findData(target) if target else -1
+        self.target_list.setCurrentIndex(max(0, index))
+        self.target_list.blockSignals(False)
+        self.target_list.setVisible(current is None and self.target_list.count() > 1)
 
     def _on_toggled(self, item_id: str, done: bool) -> None:
         self.store.set_done(item_id, done)
@@ -401,34 +689,73 @@ class TodoWindow(QWidget):
         self.store.remove(item_id)
         self.refresh()
 
+    def _move(self, item_id: str, list_id: str) -> None:
+        self.store.move(item_id, list_id)
+        self.refresh()
+
     def _add(self) -> None:
-        if self.store.add(self.input.text()) is not None:
+        target = self.current_list_id() or self.target_list.currentData()
+        if self.store.add(self.input.text(), target) is not None:
             self.input.clear()
             self.refresh()
             self.list.scrollToBottom()
 
+    def _new_list(self) -> None:
+        name, accepted = QInputDialog.getText(self, "New list", "Name this list:")
+        if not accepted:
+            return
+        created = self.store.add_list(name)
+        if created is None:
+            if name.strip():
+                QMessageBox.information(
+                    self,
+                    "Tsunade's To-Do list",
+                    f"There is already a list called \u201c{_clean(name)}\u201d.",
+                )
+            return
+        self.refresh()
+        for index in range(self.tabs.count()):
+            if self.tabs.tabData(index) == created.id:
+                self.tabs.setCurrentIndex(index)
+                break
+        self.input.setFocus()
+
     def _clear_completed(self) -> None:
-        if self.store.clear_completed():
+        if self.store.clear_completed(self.current_list_id()):
             self.refresh()
 
     # -- API --------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Rebuild the rows from the store."""
+        """Rebuild the rows (and, when needed, the tabs) from the store."""
+        if self._tabs_match_store():
+            self._update_tab_tooltips()
+            self._sync_target_list()
+        else:
+            self._rebuild_tabs()
+        list_id = self.current_list_id()
+
         self.list.clear()
-        for item in self.store.items:
-            row = TodoRow(item, self.list)
+        for item in self.store.items_for(list_id):
+            row = TodoRow(
+                item, self.store.lists, show_list=list_id is None, parent=self.list
+            )
             row.toggled.connect(self._on_toggled)
             row.deleted.connect(self._delete)
+            row.moved.connect(self._move)
             entry = QListWidgetItem(self.list)
             entry.setData(Qt.UserRole, item.id)
             entry.setSizeHint(row.sizeHint())
             self.list.addItem(entry)
             self.list.setItemWidget(entry, row)
 
-        total = len(self.store.items)
-        done = self.store.done_count
+        total, done = self.store.counts(list_id)
         pending = total - done
+        self.hint.setText(
+            "Nothing here yet - add your first task above."
+            if list_id is None
+            else "Nothing in this list yet."
+        )
         self.hint.setVisible(total == 0)
         self.list.setVisible(total > 0)
         self.progress.setVisible(total > 0)
@@ -446,19 +773,25 @@ class TodoWindow(QWidget):
         self.count.setToolTip(
             "Add your first task to get going."
             if total == 0
-            else f"{done} of {total} tasks done."
+            else f"{done} of {total} tasks done in this view."
         )
         self.progress.setToolTip(f"{done} of {total} tasks done")
         self.clear_button.setEnabled(done > 0)
         self.clear_button.setToolTip(
-            "Remove the finished tasks" if done else "Nothing to clear yet"
+            "Remove the finished tasks here" if done else "Nothing to clear yet"
         )
 
     def reload_from_disk(self) -> None:
         """Pick up edits made outside this window."""
-        before = [(i.id, i.text, i.done) for i in self.store.items]
+        before = (
+            [(lst.id, lst.name) for lst in self.store.lists],
+            [(i.id, i.text, i.done, i.list_id) for i in self.store.items],
+        )
         self.store.load()
-        after = [(i.id, i.text, i.done) for i in self.store.items]
+        after = (
+            [(lst.id, lst.name) for lst in self.store.lists],
+            [(i.id, i.text, i.done, i.list_id) for i in self.store.items],
+        )
         if before != after:
             self.refresh()
 

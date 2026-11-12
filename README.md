@@ -35,10 +35,15 @@ the 5 s pause, the scale and the animations themselves are all configurable in
 
 ### The to-do list
 
-* Add a task (**Enter** or **Add**), it is saved immediately.
+* Tasks are sorted into lists. The tabs across the top are **All** (everything
+  at once) and one tab per list; **+ List** creates a new one, and each task's
+  **⇄** button moves it to another list.
+* Add a task (**Enter** or **Add**), it is saved immediately. From the *All*
+  tab, the small picker next to the box chooses which list it lands in.
 * Tick a task to check it off — finished tasks are struck through and counted.
 * Delete any task with the **✕** button, or select it and press **Delete**.
-* **Clear done** removes all finished tasks; the counter and progress bar update.
+* **Clear done** removes the finished tasks in the view you are looking at; the
+  counter and progress bar follow the tab.
 * **Esc** or **Close** hides the window (she stays on your desktop).
 * Everything lives in `~/.config/tsunade-pet/todos.json`. If that file is ever
   damaged it is kept as `todos.json.corrupt` and she starts from an empty list

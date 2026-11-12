@@ -98,7 +98,7 @@ class TodoStoreTest(unittest.TestCase):
         store = TodoStore(self.path)
         store.add("task")
         payload = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], 2)
         self.assertEqual(payload["items"][0]["text"], "task")
         self.assertEqual([p.name for p in self.path.parent.glob("todos.json.*")], [])
 
