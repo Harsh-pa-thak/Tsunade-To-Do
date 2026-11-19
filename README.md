@@ -38,6 +38,9 @@ the 5 s pause, the scale and the animations themselves are all configurable in
 * Tasks are sorted into lists. The tabs across the top are **All** (everything
   at once) and one tab per list; **+ List** creates a new one, and each task's
   **⇄** button moves it to another list.
+* **− List** deletes the list you are looking at together with everything in
+  it — it asks first and says how many tasks will go. The last remaining list
+  cannot be deleted.
 * Add a task (**Enter** or **Add**), it is saved immediately. From the *All*
   tab, the small picker next to the box chooses which list it lands in.
 * Tick a task to check it off — finished tasks are struck through and counted.
@@ -143,7 +146,7 @@ tests/                     unit tests: to-do store, artwork, build tool
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 32 unit checks, no display needed
+python3 -m unittest discover -s tests -t .   # 52 checks, no desktop needed
 python3 tools/smoke_test.py                  # 60 checks driving the real app
 ```
 

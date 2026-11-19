@@ -22,6 +22,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -226,6 +227,23 @@ class TodoStore:
         self.save()
         return item
 
+    def delete_list(self, list_id: str) -> int | None:
+        """Remove a list and every task in it.
+
+        Returns how many tasks went with it, or ``None`` when the list does not
+        exist or is the last one (there always has to be somewhere to put a
+        task).
+        """
+        target = self.list_by_id(list_id)
+        if target is None or len(self.lists) <= 1:
+            return None
+        before = len(self.items)
+        self.items = [i for i in self.items if i.list_id != target.id]
+        self.lists = [lst for lst in self.lists if lst.id != target.id]
+        removed = before - len(self.items)
+        self.save()
+        return removed
+
     def move(self, item_id: str, list_id: str) -> bool:
         """Send a task to another list."""
         item = self.get(item_id)
@@ -330,6 +348,9 @@ QPushButton#ghost {
     font-weight: 500;
 }
 QPushButton#ghost:hover { border-color: #f0b429; color: #ffd977; }
+QPushButton#ghost:disabled {
+    color: #6b5561; border-color: #3d2a35; background: transparent;
+}
 QPushButton#tab {
     background: transparent;
     color: #c8aebd;
@@ -374,6 +395,23 @@ QProgressBar {
 }
 QProgressBar::chunk { background: #f0b429; border-radius: 4px; }
 QFrame#rule { background: #462b39; max-height: 1px; border: none; }
+"""
+
+#: Dialogs are their own top-level windows, so they do not inherit the card's
+#: colours. Without this they would draw near-white text on the system's light
+#: dialog background - which is exactly how the "new list" and "delete list"
+#: prompts used to come out unreadable.
+DIALOG_STYLE = STYLE + """
+QDialog, QMessageBox, QInputDialog { background: #2b1a24; }
+QDialog QLabel, QMessageBox QLabel, QInputDialog QLabel { color: #f7efe2; }
+QMessageBox QLabel#qt_msgbox_label { font-size: 13px; }
+QDialog QPushButton, QMessageBox QPushButton, QInputDialog QPushButton {
+    min-width: 82px;
+    padding: 7px 16px;
+}
+QDialog QPushButton:default, QMessageBox QPushButton:default {
+    background: #f0b429; color: #2b1a24;
+}
 """
 
 
@@ -555,8 +593,13 @@ class TodoWindow(QWidget):
         self.new_list_button.setObjectName("ghost")
         self.new_list_button.setToolTip("Add another list")
         self.new_list_button.setCursor(Qt.PointingHandCursor)
+        self.delete_list_button = QPushButton("\u2212 List", card)
+        self.delete_list_button.setObjectName("ghost")
+        self.delete_list_button.setToolTip("Delete the list you are looking at")
+        self.delete_list_button.setCursor(Qt.PointingHandCursor)
         listbar.addWidget(self.tabs, 1)
         listbar.addWidget(self.new_list_button)
+        listbar.addWidget(self.delete_list_button)
         root.addLayout(listbar)
 
         # -- entry ---------------------------------------------------------
@@ -613,6 +656,7 @@ class TodoWindow(QWidget):
         self.close_button.clicked.connect(self.hide)
         self.list.delete_requested.connect(self._delete)
         self.new_list_button.clicked.connect(self._new_list)
+        self.delete_list_button.clicked.connect(self._delete_list)
         self.tabs.currentChanged.connect(lambda _index: self.refresh())
 
         self.refresh()
@@ -700,18 +744,54 @@ class TodoWindow(QWidget):
             self.refresh()
             self.list.scrollToBottom()
 
+    # -- dialogs ----------------------------------------------------------
+    #
+    # Each prompt is built, themed and run in one place and exposed as a small
+    # overridable method, so the window can be tested without a modal loop.
+
+    def _ask_text(self, title: str, label: str) -> str | None:
+        """Ask for a single line of text; ``None`` when cancelled."""
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setLabelText(label)
+        dialog.setInputMode(QInputDialog.TextInput)
+        dialog.setStyleSheet(DIALOG_STYLE)
+        accepted = dialog.exec() == QDialog.Accepted
+        text = dialog.textValue()
+        dialog.deleteLater()
+        return text if accepted else None
+
+    def _warn(self, message: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Tsunade's To-Do list")
+        box.setIcon(QMessageBox.Information)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.setStyleSheet(DIALOG_STYLE)
+        box.exec()
+        box.deleteLater()
+
+    def _confirm(self, title: str, question: str) -> bool:
+        """Ask a yes/no question, defaulting to *no*."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Warning)
+        box.setText(question)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        box.setStyleSheet(DIALOG_STYLE)
+        answer = box.exec()
+        box.deleteLater()
+        return answer == QMessageBox.Yes
+
     def _new_list(self) -> None:
-        name, accepted = QInputDialog.getText(self, "New list", "Name this list:")
-        if not accepted:
+        name = self._ask_text("New list", "Name this list:")
+        if name is None:
             return
         created = self.store.add_list(name)
         if created is None:
             if name.strip():
-                QMessageBox.information(
-                    self,
-                    "Tsunade's To-Do list",
-                    f"There is already a list called \u201c{_clean(name)}\u201d.",
-                )
+                self._warn(f"There is already a list called \u201c{_clean(name)}\u201d.")
             return
         self.refresh()
         for index in range(self.tabs.count()):
@@ -719,6 +799,27 @@ class TodoWindow(QWidget):
                 self.tabs.setCurrentIndex(index)
                 break
         self.input.setFocus()
+
+    def _delete_list(self) -> None:
+        list_id = self.current_list_id()
+        if list_id is None or len(self.store.lists) <= 1:
+            return
+        target = self.store.list_by_id(list_id)
+        if target is None:
+            return
+        total, _done = self.store.counts(target.id)
+        if total == 0:
+            question = f"Delete the empty list \u201c{target.name}\u201d?"
+        else:
+            question = (
+                f"Delete the list \u201c{target.name}\u201d and its {total} "
+                f"task{'s' if total != 1 else ''}?\n\nThis cannot be undone."
+            )
+        if not self._confirm("Delete list", question):
+            return
+        self.store.delete_list(target.id)
+        self.tabs.setCurrentIndex(0)
+        self.refresh()
 
     def _clear_completed(self) -> None:
         if self.store.clear_completed(self.current_list_id()):
@@ -776,6 +877,17 @@ class TodoWindow(QWidget):
             else f"{done} of {total} tasks done in this view."
         )
         self.progress.setToolTip(f"{done} of {total} tasks done")
+        can_delete = list_id is not None and len(self.store.lists) > 1
+        self.delete_list_button.setEnabled(can_delete)
+        self.delete_list_button.setToolTip(
+            "Delete this list and everything in it"
+            if can_delete
+            else (
+                "Open a list to delete it"
+                if list_id is None
+                else "At least one list has to remain"
+            )
+        )
         self.clear_button.setEnabled(done > 0)
         self.clear_button.setToolTip(
             "Remove the finished tasks here" if done else "Nothing to clear yet"

@@ -132,6 +132,104 @@ class TodoStoreTest(unittest.TestCase):
         self.assertEqual([i.text for i in store.items], ["one", "two", "no id", "three"])
         self.assertEqual(len({i.id for i in store.items}), len(store.items))
         self.assertTrue(store.items[-1].done)
+    # -- lists ------------------------------------------------------------
+
+    def test_new_store_has_one_list(self) -> None:
+        store = TodoStore(self.path)
+        self.assertEqual([lst.name for lst in store.lists], ["General"])
+        item = store.add("task")
+        self.assertEqual(item.list_id, store.lists[0].id)
+
+    def test_add_list_rejects_blank_and_duplicate_names(self) -> None:
+        store = TodoStore(self.path)
+        self.assertIsNone(store.add_list("   "))
+        self.assertIsNone(store.add_list("general"))  # case-insensitive
+        created = store.add_list("  Phy  ")
+        self.assertIsNotNone(created)
+        self.assertEqual(created.name, "Phy")
+        self.assertEqual(len(store.lists), 2)
+
+    def test_tasks_go_into_the_requested_list(self) -> None:
+        store = TodoStore(self.path)
+        phy = store.add_list("Phy")
+        chy = store.add_list("Chy")
+        store.add("vectors", phy.id)
+        store.add("benzene", chy.id)
+        self.assertEqual([i.text for i in store.items_for(phy.id)], ["vectors"])
+        self.assertEqual([i.text for i in store.items_for(chy.id)], ["benzene"])
+        self.assertEqual(len(store.items_for()), 2)
+        self.assertEqual(store.counts(phy.id), (1, 0))
+
+    def test_move_between_lists(self) -> None:
+        store = TodoStore(self.path)
+        phy = store.add_list("Phy")
+        chy = store.add_list("Chy")
+        item = store.add("task", phy.id)
+        self.assertFalse(store.move(item.id, phy.id))  # already there
+        self.assertFalse(store.move("missing", chy.id))
+        self.assertFalse(store.move(item.id, "missing-list"))
+        self.assertTrue(store.move(item.id, chy.id))
+        self.assertEqual(store.get(item.id).list_id, chy.id)
+        self.assertEqual([i.text for i in TodoStore(self.path).items_for(chy.id)], ["task"])
+
+    def test_delete_list_takes_its_tasks_with_it(self) -> None:
+        store = TodoStore(self.path)
+        phy = store.add_list("Phy")
+        chy = store.add_list("Chy")
+        store.add("vectors", phy.id)
+        store.add("benzene", chy.id)
+        store.add("orbitals", chy.id)
+        self.assertEqual(store.delete_list(phy.id), 1)
+        self.assertEqual([lst.name for lst in store.lists], ["General", "Chy"])
+        self.assertEqual([i.text for i in store.items], ["benzene", "orbitals"])
+        # ...and the removal is on disk, not just in memory.
+        reloaded = TodoStore(self.path)
+        self.assertEqual([lst.name for lst in reloaded.lists], ["General", "Chy"])
+        self.assertEqual(len(reloaded.items), 2)
+
+    def test_delete_empty_list_reports_zero(self) -> None:
+        store = TodoStore(self.path)
+        empty = store.add_list("Empty")
+        self.assertEqual(store.delete_list(empty.id), 0)
+        self.assertEqual(len(store.lists), 1)
+
+    def test_delete_list_refuses_unknown_and_last_list(self) -> None:
+        store = TodoStore(self.path)
+        only = store.lists[0]
+        self.assertIsNone(store.delete_list("nope"))
+        self.assertIsNone(store.delete_list(only.id))
+        self.assertEqual([lst.id for lst in store.lists], [only.id])
+        # The store still works afterwards.
+        store.add("still here")
+        self.assertEqual(len(TodoStore(self.path).items), 1)
+
+    def test_old_single_list_file_migrates(self) -> None:
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "items": [
+                        {"id": "a", "text": "m4", "done": False},
+                        {"id": "b", "text": "bode", "done": True},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = TodoStore(self.path)
+        self.assertEqual([lst.name for lst in store.lists], ["General"])
+        self.assertEqual([i.text for i in store.items], ["m4", "bode"])
+        self.assertTrue(all(i.list_id == store.lists[0].id for i in store.items))
+
+    def test_clear_completed_can_be_scoped_to_one_list(self) -> None:
+        store = TodoStore(self.path)
+        phy = store.add_list("Phy")
+        chy = store.add_list("Chy")
+        keep = store.add("keep", chy.id)
+        gone = store.add("gone", phy.id)
+        store.toggle(gone.id)
+        self.assertEqual(store.clear_completed(phy.id), 1)
+        self.assertEqual([i.id for i in store.items], [keep.id])
 
 
 if __name__ == "__main__":
